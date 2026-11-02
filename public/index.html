@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f4f7fc">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Claude Office">
+<title>Claude Office</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar" class="glass">
+  <button id="menuBtn" class="btn icon" title="층별 안내">🏢</button>
+  <div class="brand"><span class="logo">✳</span><div><b>Claude Office</b><small>실시간 작업 사무실</small></div></div>
+  <div class="where">
+    <div id="floorBadge" class="floor-badge">–</div>
+    <div class="where-text"><div id="floorName">연결 중…</div><div id="sessTitle"></div></div>
+  </div>
+  <div class="controls">
+    <span id="modeBadge" class="chip"></span>
+    <span id="ctlBadge" class="chip ctl" hidden title="--allow-control: 화면에서 tmux 창으로 메시지를 보내거나 멈출 수 있어요">🎮<span class="lbl"> 조종 켜짐</span></span>
+    <span id="viewBadge" class="chip" hidden title="다른 기기에서 보는 중 — 보기 전용">📱<span class="lbl"> 보기 전용</span></span>
+    <button id="followBtn" class="btn ghost" hidden>🔄<span class="lbl"> 최근 세션 따라가기</span></button>
+    <button id="staleBtn" class="btn warn" hidden title="오래 움직임이 없는 에이전트">💤<span class="lbl"> 멈춘 에이전트</span> <b id="staleCount">0</b></button>
+    <button id="agentsBtn" class="btn" title="에이전트 관리 (A)">🧑‍💼<span class="lbl"> 에이전트 관리</span></button>
+    <button id="labelsBtn" class="btn toggle" title="방마다 어떤 도구가 오는지 표시 (L)">🗺<span class="lbl"> 방 안내</span></button>
+    <button id="notifyBtn" class="btn toggle" title="질문이 오거나 작업이 끝나면 알림">🔔<span class="lbl"> 알림</span></button>
+    <button id="settingsBtn" class="btn icon" title="설정">⚙️</button>
+    <span id="conn" class="conn"></span>
+  </div>
+</header>
+
+<div id="backdrop"></div>
+<div id="layout">
+  <aside id="directory" class="glass">
+    <div class="dir-head"><div class="dir-title">CLAUDE TOWER</div><div class="dir-sub">층별 안내 · Floor guide</div></div>
+    <div id="sources"></div>
+    <div id="accounts"></div>
+    <div id="floors"></div>
+    <button id="toggleOld" class="old-btn" hidden></button>
+    <div class="dir-foot"><span class="lamp on"></span> 90초 안에 움직인 층·세션 · <kbd>[</kbd> <kbd>]</kbd> 층 이동</div>
+  </aside>
+
+  <main id="center">
+    <div id="stage" class="glass">
+      <canvas id="office"></canvas>
+      <div id="elevatorOverlay" aria-hidden="true">
+        <div class="door left"></div><div class="door right"></div>
+        <div class="panel"><div class="arrow" id="evArrow">▲</div><div class="num" id="evNum">1F</div><div class="name" id="evName"></div></div>
+      </div>
+      <div id="tooltip" class="tip" hidden></div>
+      <div id="toast"></div>
+      <div class="cam-ctl">
+        <button data-cam="in" title="확대 (+)">＋</button>
+        <button data-cam="out" title="축소 (-)">－</button>
+        <button data-cam="reset" title="처음 화면 (0)">⟲</button>
+        <button data-cam="follow" title="선택한 캐릭터 따라가기 (F)">🎯</button>
+      </div>
+      <div class="hint-bar">드래그 이동 · 휠 확대 · 클릭 자세히 · 더블클릭 따라가기 · <kbd>Esc</kbd> 닫기</div>
+    </div>
+
+    <section id="dock" class="glass">
+      <nav class="tabs">
+        <button data-tab="log">📜 활동 로그</button>
+        <button data-tab="agents">🧑‍💼 에이전트 <span id="agentsCount" class="count"></span></button>
+        <button data-tab="chat">💬 세션 간 대화 <span id="chatCount" class="count"></span></button>
+      </nav>
+
+      <div class="tab-body" data-body="log">
+        <div class="filters">
+          <input id="logSearch" type="search" placeholder="🔎 기록 검색 (파일 이름, 명령, 에이전트…)">
+          <select id="logRoom"></select>
+          <label class="check"><input type="checkbox" id="logAgents"> 서브에이전트 활동 포함</label>
+        </div>
+        <ol id="log" class="feed"></ol>
+      </div>
+
+      <div class="tab-body" data-body="agents" hidden>
+        <div class="filters">
+          <div class="seg" id="agentScope"><button data-scope="floor">이 층</button><button data-scope="all">건물 전체</button></div>
+          <div class="seg" id="agentFilters">
+            <button data-filter="all">전체 <i></i></button>
+            <button data-filter="active">일하는 중 <i></i></button>
+            <button data-filter="stale">💤 멈춤 <i></i></button>
+            <button data-filter="done">끝남 <i></i></button>
+          </div>
+          <input id="agentSearch" type="search" placeholder="🔎 이름 · 하는 일 검색">
+          <span class="spacer"></span>
+          <label class="check"><input type="checkbox" id="showHidden"> 숨김 보기 <span id="hiddenCount" class="muted"></span></label>
+          <button id="bulkStale" class="btn small warn">💤 멈춘 에이전트 모두 퇴근</button>
+          <button id="bulkDone" class="btn small">✅ 끝난 기록 정리</button>
+        </div>
+        <div class="table-wrap"><table id="agentTable"></table></div>
+        <p class="hint">퇴근·숨기기는 이 화면에서만 정리돼요. 실제 작업을 멈추려면 에이전트를 눌러 "중지 요청 문구"를 복사해 소속 Claude에게 보내세요.</p>
+      </div>
+
+      <div class="tab-body" data-body="chat" hidden>
+        <ol id="chat" class="feed"></ol>
+      </div>
+    </section>
+  </main>
+
+  <aside id="inspector" class="glass" hidden>
+    <button class="close" title="닫기 (Esc)">✕</button>
+    <div id="inspBody"></div>
+  </aside>
+</div>
+
+<div id="settings" class="modal" hidden>
+  <div class="glass sheet">
+    <button class="close">✕</button>
+    <h3>⚙️ 설정</h3>
+    <label class="row">에이전트를 "멈춤"으로 볼 시간
+      <select id="staleSel"><option value="2">2분</option><option value="5">5분</option><option value="10">10분</option><option value="30">30분</option></select>
+    </label>
+    <label class="row"><span>같은 층 동료 세션 함께 보기</span><input type="checkbox" id="coworkersToggle"></label>
+    <div class="row"><span>숨긴 에이전트 <b id="hiddenTotal">0</b>개</span><button id="resetHidden" class="btn small">숨김 초기화</button></div>
+    <h4>단축키</h4>
+    <div class="keys"><kbd>+</kbd><kbd>-</kbd> 확대·축소 <kbd>0</kbd> 처음 화면 <kbd>F</kbd> 따라가기 <kbd>A</kbd> 에이전트 <kbd>L</kbd> 방 안내 <kbd>[</kbd><kbd>]</kbd> 층 이동 <kbd>Esc</kbd> 닫기</div>
+    <p class="hint">이 화면은 Claude Code 기록을 읽기만 합니다. 세션에 무언가 보내야 할 땐 복사 버튼으로 명령을 만들어 직접 붙여 넣으세요.</p>
+  </div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

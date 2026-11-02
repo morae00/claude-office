@@ -1,0 +1,14 @@
+{
+  "name": "claude-office",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claude Code 세션 기록을 따라 읽어 사무실처럼 보여 주는 로컬 대시보드",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs --open",
+    "demo": "node demo.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

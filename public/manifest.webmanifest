@@ -1,0 +1,10 @@
+{
+  "name": "Claude Office",
+  "short_name": "Office",
+  "description": "Claude Code 작업을 사무실로 보여 주는 대시보드",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f7fc",
+  "theme_color": "#f4f7fc",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
