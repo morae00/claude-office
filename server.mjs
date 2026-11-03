@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { LocalSource, SshSource } from './lib/sources.mjs';
 import { SessionModel } from './lib/model.mjs';
 import { Broker } from './lib/broker.mjs';
-import { rankPanes } from './lib/control.mjs';
+import { rankPanes, terminalEntry } from './lib/control.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, 'public');
@@ -43,7 +43,7 @@ function parseArgs(argv) {
   --root PATH[=이름]   이 PC에서 추가로 읽을 설정 폴더 (CLAUDE_CONFIG_DIR 등)
   --no-local          이 PC의 세션은 빼고 SSH 호스트만 표시
   --only-roots        자동 탐색 없이 --root 로 준 폴더만 읽기
-  --allow-control     화면에서 tmux 창으로 메시지 보내기 · 멈추기(Esc) 허용 (기본은 읽기 전용)
+  --allow-control     화면에서 tmux 창으로 메시지 보내기 · 멈추기(Esc), 세션 종료 · 휴지통으로 옮기기 허용 (기본은 읽기 전용)
   --share             휴대폰 등 다른 기기에서 보기 (같은 네트워크, 접속 키 필요)
   --key KEY           --share 접속 키를 직접 정하기 (기본: 켤 때마다 새로 만듦)
   --python CMD        원격에서 쓸 파이썬 (기본 python3)
@@ -325,9 +325,10 @@ class Hub {
     }
     const unnumbered = [...this.floors.values()].filter((f) => !f.num).sort((a, b) => b.mtime - a.mtime);
     for (const f of unnumbered) f.num = this.nextFloor++;
-    // Keep recently active sessions watched so cross-session messages and coworkers work.
+    // Keep recently active sessions watched so cross-session messages and coworkers work, and every
+    // session whose claude is still open: it may be sitting on a question for hours.
     for (const s of this.sessions.values()) {
-      if (s.src === src && now - s.mtime < AUTO_WATCH_MS) this.watch(s.id).catch(() => {});
+      if (s.src === src && (now - s.mtime < AUTO_WATCH_MS || this.procOf(s))) this.watch(s.id).catch(() => {});
     }
     this.broadcastFloors();
   }
@@ -402,16 +403,111 @@ class Hub {
   async scanProcs(src) {
     const dirs = [...new Set((src.roots || []).map((r) => r.configDir.replace(/\/+$/, '')))];
     if (!dirs.length) return;
-    const { procs = [], panes = {} } = await src.call('procs', { dirs });
+    const { procs = [], panes = {}, dirs: seen } = await src.call('procs', { dirs });
     const map = new Map();
     for (const p of procs) {
       const m = /^(.+):@?\d*\.(%\d+)$/.exec(p.tmux || '');
       map.set(`${p.configDir}|${p.sessionId}`, {
         sid: p.sessionId, pid: p.pid, name: p.name || '', status: p.status || '', cwd: p.cwd || '',
+        waitingFor: p.waitingFor || '', statusUpdatedAt: Number(p.statusUpdatedAt) || 0, entrypoint: p.entrypoint || '',
         tmux: m ? { session: m[1], pane: m[2], name: panes[m[2]] || null } : null,
       });
     }
+    // A claude waiting on a dialog: read the bottom of its pane, the dialog may not be in the log yet.
+    const waiting = [...map.values()].filter((p) => p.status === 'waiting' && p.tmux);
+    if (waiting.length) {
+      try {
+        const scr = await src.call('screens', { panes: waiting.map((p) => p.tmux.pane) });
+        for (const p of waiting) p.screen = scr[p.tmux.pane] || '';
+      } catch {}
+    }
     src.procs = map;
+    // Accounts whose claude writes sessions/<pid>.json: there, no file means the session is closed.
+    src.procDirs = new Set(seen || []);
+  }
+
+  // Is this session waiting on a human, and for what? Claude's own status file says whether it is
+  // waiting (a dialog is open); the log says on what (a question, a plan, a tool to allow) or how the
+  // last turn ended (with a question to you, or after messaging another session).
+  attentionOf(s) {
+    const p = this.procOf(s);
+    if (p && p.status && p.status !== 'idle' && p.status !== 'waiting') return null; // busy, running a shell command, …
+    const w = this.watchers.get(s.id);
+    const wi = w && w.ready ? w.model.waitInfo() : null;
+    const askOf = (a, since) => (a.kind === 'plan'
+      ? { kind: 'plan', since: since || a.ts, plan: a.plan }
+      : { kind: 'question', since: since || a.ts, questions: a.questions });
+    if (p && p.status === 'waiting') {
+      const screen = p.screen ? { screen: p.screen } : {};
+      if (wi && wi.ask) return { ...askOf(wi.ask, p.statusUpdatedAt), ...screen };
+      if (wi && wi.tool) return { kind: 'permission', since: p.statusUpdatedAt || wi.tool.ts, tool: wi.tool, ...screen };
+      return { kind: 'dialog', since: p.statusUpdatedAt, text: WAITING_FOR[p.waitingFor] || p.waitingFor || '', ...screen };
+    }
+    if (!wi) return null;
+    const acct = this.accounts.get(s.akey);
+    const tracked = !!(acct && s.src.procDirs && s.src.procDirs.has(acct.configDir));
+    // Closed sessions wait for nobody. Without status files (older Claude Code), trust a recent log.
+    if (!p && (tracked || Date.now() - (wi.lastTs || 0) > 6 * 3600 * 1000)) return null;
+    if (!p && wi.ask) return askOf(wi.ask, 0);
+    const e = wi.ended;
+    if (e && e.question) return { kind: 'reply', since: e.ts, text: e.text };
+    if (e && e.peer) return { kind: 'peer', since: e.ts, target: e.peer, text: e.text };
+    return null;
+  }
+
+  // Forget a session that was moved to the trash: no more watching, gone from every open page.
+  forget(id) {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    this.watchers.delete(id);
+    this.sessions.delete(id);
+    const f = this.floors.get(s.fkey);
+    if (f) f.sessions.delete(id);
+    for (const v of this.views) {
+      const off = v.shown.get(id);
+      if (off) { off(); v.shown.delete(id); v.send({ t: 'drop', sid: id }); }
+      if (v.pinSid === id) { v.pinSid = null; v.mode = 'follow'; }
+      if (v.primary === id) v.primary = null;
+    }
+    this.broadcastFloors();
+  }
+
+  // Every session in the building for the session manager (the floor guide shows only recent ones).
+  sessionList() {
+    return [...this.sessions.values()].map((s) => {
+      const p = this.procOf(s);
+      const w = this.watchers.get(s.id);
+      const acct = this.accounts.get(s.akey) || {};
+      const f = this.floors.get(s.fkey);
+      const entry = (p && p.entrypoint) || s.entrypoint || '';
+      const wait = this.attentionOf(s);
+      return {
+        sid: s.id, sessionId: s.sid, title: s.title || (w && w.model.title) || '', firstPrompt: s.firstPrompt || '', akey: s.akey,
+        acct: acct.label || '', color: acct.color || PALETTE[0], host: s.src.remote ? s.src.label : null,
+        floor: f ? f.num : null, floorName: f ? f.name : '', fkey: s.fkey, cwd: s.cwd || (f && f.cwd) || '',
+        size: s.size, mtime: Math.max(s.mtime, s.activeTs || 0), startTs: s.startTs, entry, manageable: terminalEntry(entry),
+        proc: p ? { pid: p.pid, status: p.status, waitingFor: p.waitingFor, tmux: p.tmux, name: p.name } : null,
+        wait: wait ? wait.kind : null,
+      };
+    });
+  }
+
+  async trashList() {
+    const out = [];
+    for (const src of this.sources) {
+      const accts = [...this.accounts.values()].filter((a) => a.src === src.id);
+      if (!accts.length) continue;
+      let list = [];
+      try {
+        // An SSH host that is reconnecting would hold the whole list up; skip it after a moment.
+        list = await Promise.race([src.call('trash_list', { dirs: accts.map((a) => a.configDir) }), new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 5000))]);
+      } catch { continue; }
+      for (const t of list) {
+        const a = accts.find((x) => x.configDir === t.configDir);
+        if (a) out.push({ akey: a.key, acct: a.label, color: a.color, host: src.remote ? src.label : null, entry: t.entry, sessionId: t.sessionId, dirName: t.dirName, title: t.title, deletedAt: t.deletedAt, items: t.items });
+      }
+    }
+    return out.sort((a, b) => b.deletedAt - a.deletedAt);
   }
 
   procOf(s) {
@@ -460,7 +556,7 @@ class Hub {
   gcWatchers() {
     const now = Date.now();
     for (const [id, w] of this.watchers) {
-      if (w.listeners.size || !w.ready) continue;
+      if (w.listeners.size || !w.ready || this.procOf(w.sess)) continue;
       if (now - w.lastWanted > 60000 && now - (w.sess.activeTs || w.sess.mtime) > AUTO_WATCH_MS + 5 * 60000) this.watchers.delete(id);
     }
   }
@@ -491,11 +587,12 @@ class Hub {
     const floors = [...this.floors.values()].sort((a, b) => b.num - a.num).map((f) => ({
       fkey: f.fkey, num: f.num, name: f.name, cwd: f.cwd, host: f.src.remote ? f.src.label : null, mtime: f.mtime,
       // `sid` is the session key the browser uses everywhere; `sessionId` is Claude's own id.
+      // The 40 most recent, plus any whose claude is still open (one of those may be waiting on you).
       sessions: [...f.sessions].map((id) => this.sessions.get(id)).filter(Boolean)
-        .sort((a, b) => (b.activeTs || b.mtime) - (a.activeTs || a.mtime)).slice(0, 40)
+        .sort((a, b) => (b.activeTs || b.mtime) - (a.activeTs || a.mtime)).filter((s, i) => i < 40 || this.procOf(s))
         .map((s) => {
           const w = this.watchers.get(s.id);
-          return { sid: s.id, sessionId: s.sid, title: s.title || (w && w.model.title) || s.firstPrompt || '', akey: s.akey, mtime: Math.max(s.mtime, s.activeTs || 0), startTs: s.startTs, busy: !!(w && w.model.busy), ...this.procBits(s) };
+          return { sid: s.id, sessionId: s.sid, title: s.title || (w && w.model.title) || s.firstPrompt || '', akey: s.akey, mtime: Math.max(s.mtime, s.activeTs || 0), startTs: s.startTs, busy: !!(w && w.model.busy), ...this.procBits(s), wait: this.attentionOf(s) };
         }),
     }));
     return {
@@ -545,13 +642,19 @@ class Hub {
 
   procBits(s) {
     const p = this.procOf(s);
-    return { tmux: (p && p.tmux) || null, procName: p ? p.name : null, procStatus: p ? p.status : null };
+    return { tmux: (p && p.tmux) || null, procName: p ? p.name : null, procStatus: p ? p.status : null, live: !!p };
   }
 
   broadcastLink(link) {
     for (const v of this.views) v.send({ t: 'link', link });
   }
 }
+
+// sessions/<pid>.json "waitingFor" when no question / plan / tool call explains it.
+const WAITING_FOR = {
+  'input needed': '입력을 기다려요', 'dialog open': '열린 창에서 선택을 기다려요', 'sandbox request': '샌드박스 허용을 기다려요',
+  'goal proposal': '목표 제안 확인을 기다려요', 'worker request': '작업자 요청 확인을 기다려요',
+};
 
 function labelFromSshRoots(cfg) {
   for (const r of OPT.sshRoots) {
@@ -580,6 +683,7 @@ function readHead(s, text) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
     if (!s.cwd && o.cwd) s.cwd = o.cwd;
+    if (!s.entrypoint && o.entrypoint) s.entrypoint = o.entrypoint;
     if (!s.startTs && o.timestamp) s.startTs = Date.parse(o.timestamp) || 0;
     if (o.type === 'custom-title' && o.customTitle) s.title = o.customTitle;
     if (!s.firstPrompt && o.type === 'user' && !o.isMeta && o.message) {
@@ -797,7 +901,63 @@ function readBody(req) {
 
 const bindings = new Map(); // session key -> tmux pane picked by the user in the UI
 
+const whereOf = (s) => {
+  const acct = hub.accounts.get(s.akey) || {};
+  return `${s.src.remote ? s.src.label + ' ' : ''}${acct.label || ''} ${s.title || s.firstPrompt || s.sid.slice(0, 8)}`.trim();
+};
+
+// Close the claude a session is open in (its process exits; the log stays).
+async function terminateSession(id) {
+  const s = hub.sessions.get(hub.resolve(id));
+  if (!s) throw new Error('세션을 찾을 수 없어요');
+  await hub.scanProcs(s.src); // decide on fresh status files, not ones up to 3 s old
+  const p = hub.procOf(s);
+  if (!p) return { ok: true, already: true };
+  if (!terminalEntry(p.entrypoint)) throw new Error('데스크톱 앱·IDE에서 연 세션은 그 앱에서 닫아 주세요');
+  console.log(`[control] ⏏ 세션 종료 → ${whereOf(s)} (pid ${p.pid}${p.tmux ? `, tmux ${p.tmux.name || p.tmux.session}` : ''})`);
+  const r = await s.src.call('kill', { configDir: hub.accounts.get(s.akey).configDir, pid: p.pid, sessionId: s.sid });
+  await hub.scanProcs(s.src);
+  hub.broadcastFloors();
+  return r;
+}
+
+// Move a closed session's log (and its side files) to <configDir>/office-trash so Claude no longer lists it.
+async function trashSessionById(id) {
+  const s = hub.sessions.get(hub.resolve(id));
+  if (!s) throw new Error('세션을 찾을 수 없어요');
+  await hub.scanProcs(s.src);
+  const p = hub.procOf(s);
+  if (p) throw new Error('아직 실행 중이에요. 먼저 종료해 주세요');
+  if (!terminalEntry(s.entrypoint)) throw new Error('데스크톱 앱·IDE 세션 기록은 그 앱에서 지워 주세요');
+  console.log(`[control] 🗑 휴지통으로 → ${whereOf(s)}`);
+  const r = await s.src.call('trash', {
+    configDir: hub.accounts.get(s.akey).configDir, root: s.root, dirName: s.dirName, sessionId: s.sid, title: s.title || s.firstPrompt || '',
+  });
+  hub.forget(s.id);
+  return r;
+}
+
 async function apiControl(body) {
+  if (body.action === 'terminate' || body.action === 'trash') {
+    const ids = (Array.isArray(body.sids) ? body.sids : [body.sid]).filter(Boolean).slice(0, 200);
+    const results = [];
+    for (const id of ids) {
+      try {
+        let r = {};
+        if (body.action === 'terminate' || body.alsoClose) r = await terminateSession(id);
+        if (body.action === 'trash') r = await trashSessionById(id);
+        results.push({ sid: id, ...r, ok: r.ok !== false });
+      } catch (e) { results.push({ sid: id, ok: false, error: String(e.message || e) }); }
+    }
+    return { ok: true, results };
+  }
+  if (body.action === 'restore') {
+    const acct = hub.accounts.get(body.akey);
+    const src = acct && sources.find((x) => x.id === acct.src);
+    if (!src) throw new Error('계정을 찾을 수 없어요');
+    console.log(`[control] ↩︎ 휴지통에서 되돌리기 → ${acct.label} ${body.entry}`);
+    return src.call('restore', { configDir: acct.configDir, entry: body.entry });
+  }
   const s = hub.sessions.get(hub.resolve(body.sid));
   if (!s) throw new Error('세션을 찾을 수 없어요');
   const acct = hub.accounts.get(s.akey) || {};
@@ -865,6 +1025,11 @@ const server = http.createServer((req, res) => {
     readBody(req).then(apiControl).then((out) => json(res, 200, out)).catch((e) => json(res, 400, { error: String(e.message || e) }));
     return;
   }
+  if (u.pathname === '/api/sessions') {
+    // Read-only list for the session manager (closing / deleting goes through /api/control).
+    hub.trashList().catch(() => []).then((trash) => json(res, 200, { now: Date.now(), sessions: hub.sessionList(), trash }));
+    return;
+  }
   if (u.pathname === '/api/panes') {
     // Read-only: which tmux pane is this session running in?
     const s = hub.sessions.get(hub.resolve(u.searchParams.get('sid')));
@@ -895,7 +1060,7 @@ server.listen(OPT.port, OPT.host, () => {
   console.log(`\n🏢 Claude Office 영업 시작: ${url}`);
   console.log(`   읽는 곳: ${sources.map((s) => s.remote ? `ssh ${s.host}` : '이 PC').join(', ')}`);
   console.log(OPT.allowControl
-    ? '   ⚠️  조종 켜짐: 화면에서 claude가 도는 tmux 창으로 메시지를 보내거나 멈출 수 있어요.\n'
+    ? '   ⚠️  조종 켜짐: 화면에서 claude가 도는 tmux 창으로 메시지를 보내거나 멈추고, 세션을 종료하거나 휴지통(설정 폴더/office-trash)으로 옮길 수 있어요.\n'
     : '   조종 꺼짐 (읽기 전용). 켜려면 --allow-control\n');
   if (ACCESS_KEY) {
     const nets = Object.values(os.networkInterfaces()).flat().filter((n) => n && !n.internal);

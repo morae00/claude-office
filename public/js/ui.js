@@ -3,7 +3,7 @@
 import { $, $$, S, actors, prefs, savePrefs, isHidden, setHidden, nowS, esc, ago, dur, hhmmss, fmtTok, copyText } from './state.js';
 import { ROOM_INFO, R } from './world.js';
 import { cam, screenOf, setZoom } from './iso.js';
-import { STATUS, statusOf, sessionEntry } from './status.js';
+import { STATUS, statusOf, sessionEntry, WAIT, waitOf, waitList, waitBodyHtml } from './status.js';
 import { sendHome, releaseSpot } from './actors.js';
 import { currentBoard } from './scene.js';
 
@@ -102,6 +102,11 @@ function floorSess(sid) {
   return null;
 }
 
+export function waitChip(w) {
+  const m = w && WAIT[w.kind];
+  return m ? `<span class="wchip ${m.me ? 'me' : ''}" title="${esc(m.label)}">${m.icon}<span class="lbl"> ${esc(m.label)}</span></span>` : '';
+}
+
 export function renderDirectory() {
   const now = nowS();
   const src = S.sources.filter((s) => s.remote || s.status !== 'ok');
@@ -115,7 +120,7 @@ export function renderDirectory() {
   for (const f of S.floors) {
     const isCur = f.fkey === S.view.floor;
     const active = now - f.mtime < 90000;
-    const old = now - f.mtime > 7 * 86400000;
+    const old = now - f.mtime > 7 * 86400000 && !f.sessions.some((s) => s.wait || s.live);
     if (old && !isCur && !S.showOld) { hidden++; continue; }
     const busy = f.sessions.some((s) => s.busy);
     let body = '';
@@ -125,19 +130,20 @@ export function renderDirectory() {
         const primary = s.sid === S.view.primary;
         const shown = S.sessions.has(s.sid);
         const pin = primary && S.view.mode === 'pin';
-        return `<li class="store ${primary ? 'primary' : shown ? 'coworker' : ''}" data-sid="${esc(s.sid)}" title="클릭하면 이 세션에 고정 📌">
+        return `<li class="store ${primary ? 'primary' : shown ? 'coworker' : ''} ${s.wait ? 'waiting' : ''}" data-sid="${esc(s.sid)}" title="클릭하면 이 세션에 고정 📌">
           <span class="lamp ${on ? 'on' : ''} ${s.busy ? 'busy' : ''}"></span>
-          <span class="t">${pin ? '📌 ' : primary ? '👁 ' : shown ? '👥 ' : ''}${esc(s.title || '새 세션')}${s.tmux ? `<br>${tmuxChip(s)}` : ''}</span>
+          <span class="t">${pin ? '📌 ' : primary ? '👁 ' : shown ? '👥 ' : ''}${esc(s.title || '새 세션')}${s.wait || s.tmux ? `<br>${waitChip(s.wait)}${tmuxChip(s)}` : ''}</span>
           <span class="meta">${acctChip(s.akey)}<span>${esc(ago(s.mtime))}</span></span></li>`;
       }).join('') || '<li class="store empty">세션 없음</li>'}</ul>`;
     } else if (f.sessions.length) {
       const names = f.sessions.map((s) => s.title || '새 세션');
       body = `<div class="stores">${esc(names.slice(0, 3).join(' · '))}${names.length > 3 ? ` 외 ${names.length - 3}` : ''}</div>`;
     }
+    const waits = f.sessions.filter((s) => s.wait && WAIT[s.wait.kind] && WAIT[s.wait.kind].me).length;
     html.push(`<div class="floor ${isCur ? 'current' : ''} ${old ? 'old' : ''}">
       <div class="floor-row" data-fkey="${esc(f.fkey)}" title="${esc(f.cwd || f.name)}">
         <span class="fnum">${f.num}F</span><span class="lamp ${active ? 'on' : ''} ${busy ? 'busy' : ''}"></span>
-        <span class="fname">${esc(f.name)}</span>${f.host ? `<span class="fhost">🖥 ${esc(f.host)}</span>` : '<span></span>'}
+        <span class="fname">${esc(f.name)}${waits ? ` <span class="wchip me" title="내 결정을 기다리는 세션 ${waits}개">✋${waits}</span>` : ''}</span>${f.host ? `<span class="fhost">🖥 ${esc(f.host)}</span>` : '<span></span>'}
       </div>${body}</div>`);
   }
   const next = html.join('') || '<div class="stores pad">아직 층이 없어요. Claude Code를 한 번 실행해 보세요.</div>';
@@ -213,9 +219,9 @@ function tooltipHtml(t) {
     const a = actors.get(t.id);
     if (!a) return '';
     if (a.kind === 'user') {
-      const asks = [...S.sessions.values()].filter((s) => s.claude && s.claude.act === 'ask');
+      const asks = waitList().filter((x) => WAIT[x.w.kind].me);
       return `<div class="tt-h"><b>🧑‍💻 나</b><span class="muted">내 자리</span></div>
-        <div class="tt-r">${asks.length ? `❓ 답을 기다리는 질문 ${asks.length}건` : '기다리는 질문 없음'}</div><div class="tt-f">클릭하면 자세히</div>`;
+        <div class="tt-r">${asks.length ? `✋ 내 결정·답을 기다리는 세션 ${asks.length}개 (건물 전체)` : '기다리는 질문 없음'}</div><div class="tt-f">클릭하면 자세히</div>`;
     }
     const s = S.sessions.get(a.sid);
     if (!s) return '';
@@ -223,10 +229,11 @@ function tooltipHtml(t) {
       const st = statusOf(sessionEntry(s), 'claude', sm);
       const c = s.claude || {};
       const working = [...s.agents.values()].filter((x) => x.status === 'working').length;
+      const w = waitOf(s.sid);
       return `<div class="tt-h"><b style="color:${esc(s.meta.color)}">${esc(a.name)}</b>${chip(st)}</div>
         <div class="tt-t">${esc(s.meta.title || '새 세션')}</div>
         ${c.label ? `<div class="tt-r">지금 <b>${esc(c.label)}</b>${c.toolSince ? ` <span class="muted">· ${dur(nowS() - c.toolSince)}째</span>` : ''}</div>` : ''}
-        ${c.act === 'ask' && c.question ? `<div class="tt-r warn">❓ ${esc(c.question)}</div>` : ''}
+        ${w ? `<div class="tt-r warn">${WAIT[w.kind].icon} ${esc(WAIT[w.kind].label)} <span class="muted">· ${ago(w.since)}부터</span></div>` : c.act === 'ask' && c.question ? `<div class="tt-r warn">❓ ${esc(c.question)}</div>` : ''}
         ${s.lastPrompt ? `<div class="tt-r muted">마지막 요청: ${esc(s.lastPrompt.text.slice(0, 80))}</div>` : ''}
         <div class="tt-g"><span>도구 <b>${s.stats.tools}</b></span><span>오류 <b>${s.stats.errors}</b></span><span>컨텍스트 <b>${fmtTok(s.stats.context)}</b></span><span>서브에이전트 <b>${working}</b></span></div>
         <div class="tt-f">클릭하면 자세히 · 더블클릭하면 따라가기</div>`;
@@ -324,11 +331,12 @@ function renderInspector(full) {
     if (t.kind === 'actor' && t.id.startsWith('c:')) loadPanes(t.id.slice(2));
     return;
   }
-  // light refresh of the live bits
+  // light refresh of the live bits; compared with what was last written (not innerHTML), so a <details>
+  // the user opened isn't rebuilt and closed again every second
   const live = liveBits(t);
   for (const [k, v] of Object.entries(live)) {
     const el = $(`#inspBody [data-live="${k}"]`);
-    if (el && el.innerHTML !== v) el.innerHTML = v;
+    if (el && (el.dataset.v ?? el.innerHTML) !== v) { el.innerHTML = v; el.dataset.v = v; }
   }
 }
 
@@ -353,6 +361,8 @@ function liveBits(t) {
     out.now = c.label ? `${esc(c.label)}${c.toolSince ? ` <span class="muted">· ${dur(nowS() - c.toolSince)}째</span>` : ''}` : `<span class="muted">${c.act === 'idle' ? '쉬는 중' : c.act === 'think' ? '생각 중' : '—'}</span>`;
     out.stats = statGrid([['도구 호출', s.stats.tools], ['오류', s.stats.errors], ['요청', s.stats.turns], ['입력 토큰', fmtTok(s.stats.in + s.stats.cacheRead + s.stats.cacheWrite)], ['출력 토큰', fmtTok(s.stats.out)], ['컨텍스트', fmtTok(s.stats.context)], ['마지막 활동', ago(s.lastTs)], ['모델', esc((s.stats.model || '—').replace(/^claude-/, ''))]]);
     out.agents = agentChips(s);
+    const w = waitOf(s.sid);
+    out.wait = w ? `<div class="wcard k-${esc(w.kind)} ${WAIT[w.kind].me ? 'me' : ''}"><div class="wc-head"><span class="wk">${WAIT[w.kind].icon} ${esc(WAIT[w.kind].label)}</span></div><div class="wc-body">${waitBodyHtml(w)}</div></div>` : '';
     out.timeline = timeline(s.log.filter((e) => e.who === 'claude' || e.who === 'user' || e.who === 'peer').slice(-40).reverse());
   } else if (t.kind === 'actor' && t.id.startsWith('a:')) {
     const { s, ag } = agentOf(t.id);
@@ -395,9 +405,12 @@ function occList(room) {
 }
 
 function userAsks() {
-  const asks = [...S.sessions.values()].filter((s) => s.claude && s.claude.act === 'ask');
+  const asks = waitList().filter((x) => WAIT[x.w.kind].me);
   if (!asks.length) return '<div class="empty">지금 답을 기다리는 질문은 없어요</div>';
-  return asks.map((s) => `<div class="card warn"><b>Claude·${esc(s.meta.acct)}</b> — ${esc(s.meta.title || '')}<div>❓ ${esc(s.claude.question || s.claude.label || '질문')}</div><button class="mini" data-act="select" data-id="c:${esc(s.sid)}">이 Claude 보기</button></div>`).join('');
+  return asks.slice(0, 6).map(({ s, f, w }) => {
+    const a = S.accounts.get(s.akey);
+    return `<div class="card warn">${WAIT[w.kind].icon} <b>Claude·${esc(a ? a.label : '')}</b> — ${esc(s.title || '')} <span class="muted">${f.num}F · ${ago(w.since)}부터</span></div>`;
+  }).join('') + '<button class="mini" data-act="waitTab">✋ 결정 대기 목록 열기</button>';
 }
 
 function inspectorHtml(t) {
@@ -415,7 +428,7 @@ function inspectorHtml(t) {
     return `
       <div class="insp-head"><span class="avatar" style="--c:${esc(m.color)}">✳</span><div><div class="title">Claude·${esc(m.acct || '')} <span data-live="tmux">${live.tmux}</span></div><div class="sub">${esc(m.title || '새 세션')}</div></div><span data-live="status">${live.status}</span></div>
       <div class="kv"><span>지금</span><b data-live="now">${live.now}</b></div>
-      ${s.claude && s.claude.act === 'ask' && s.claude.question ? `<div class="card warn">❓ ${esc(s.claude.question)}</div>` : ''}
+      <div data-live="wait">${live.wait}</div>
       <div data-live="stats">${live.stats}</div>
       ${s.lastPrompt ? `<details open><summary>마지막 요청 <span class="muted">${ago(s.lastPrompt.ts)}</span></summary><pre>${esc(s.lastPrompt.text)}</pre></details>` : ''}
       <h4>서브에이전트</h4><div data-live="agents">${live.agents}</div>
@@ -497,7 +510,7 @@ function agentColor(type) {
 }
 
 // ---- tmux: find the pane; with --allow-control also type into it --------------------------
-async function controlCall(body) {
+export async function controlCall(body) {
   const r = await fetch('/api/control', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-office-token': S.config.token || '' },
@@ -620,6 +633,7 @@ function onInspectorClick(e) {
   if (act === 'unpin') { H.selectFloor(S.view.floor, true); return; }
   if (act === 'home') { sendHome(b.dataset.id); setHidden(b.dataset.id, true); toast('🏠 퇴근시켰어요 (숨김 목록에서 되돌릴 수 있어요)'); select(null); renderAgents(); return; }
   if (act === 'hide') { const on = !isHidden(b.dataset.id); setHidden(b.dataset.id, on); if (on) dropActor(b.dataset.id); renderInspector(true); renderAgents(); return; }
+  if (act === 'waitTab') { setTab('wait', true); return; }
   if (act === 'ctlSend') { ctlSend(); return; }
   if (act === 'ctlStop') { ctlStop(); return; }
   if (act === 'askStop') {
@@ -832,8 +846,8 @@ export function onFleet(prev, next) {
     const p = before.get(s.sid);
     if (!p) continue;
     const name = `Claude·${s.acct} — ${s.title || '세션'}`;
-    if (s.act === 'ask' && p.act !== 'ask') notify(`❓ ${name}`, s.question || '질문이 있어요', s);
-    if (p.busy && !s.busy) notify(`✅ ${name}`, '작업이 끝났어요', s);
+    // Questions and approvals are announced from the floor guide's wait states (manage.js).
+    if (p.busy && !s.busy && !waitOf(s.sid)) notify(`✅ ${name}`, '작업이 끝났어요', s);
   }
   const sm = staleMs();
   for (const s of next) for (const a of s.agents) {
@@ -845,7 +859,7 @@ export function onFleet(prev, next) {
   }
 }
 
-function notify(title, body, s) {
+export function notify(title, body, s) {
   if (!prefs.notify || !('Notification' in window) || Notification.permission !== 'granted') return;
   if (document.visibilityState === 'visible' && document.hasFocus()) { toast(`${title}: ${body}`); return; }
   try {

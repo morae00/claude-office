@@ -1,8 +1,9 @@
 # Claude Office remote helper.
 # Runs on the SSH host (python3 only, nothing installed): `ssh host python3 -u -c ...`.
 # Reads JSON requests line by line from stdin and answers on stdout.
-# It reads Claude Code session logs, sessions/<pid>.json and the tmux pane list. Typing into a pane ('tmux' op) only works
-# when the server was started with --allow-control (passed here as argv[2] == '1').
+# It reads Claude Code session logs, sessions/<pid>.json and the tmux pane list. Typing into a pane ('tmux'),
+# closing a session ('kill') and moving it to the trash ('trash' / 'restore') only work when the server was
+# started with --allow-control (passed here as argv[2] == '1').
 import sys, os, json, glob, base64, socket, subprocess, time, re
 
 HOME = os.path.expanduser('~')
@@ -214,8 +215,10 @@ def op_panes(a):
 
 
 # Claude Code keeps <CLAUDE_CONFIG_DIR>/sessions/<pid>.json for every running claude: session id, name,
-# status and, inside tmux, its pane ("master:@0.%0"). Only <pid>.json is read, never <pid>.<hash>.key.
-PROC_KEYS = ('sessionId', 'pid', 'tmux', 'name', 'status', 'cwd')
+# status (busy / idle / waiting + waitingFor) and, inside tmux, its pane ("master:@0.%0").
+# Only <pid>.json is read, never <pid>.<hash>.key.
+PROC_KEYS = ('sessionId', 'pid', 'tmux', 'name', 'status', 'waitingFor', 'statusUpdatedAt', 'cwd',
+             'entrypoint', 'procStart')
 
 
 def pid_alive(pid, proc_start):
@@ -226,6 +229,8 @@ def pid_alive(pid, proc_start):
         with open('/proc/%d/stat' % pid) as f:
             st = f.read()
         fields = st[st.rindex(')') + 2:].split(' ')
+        if fields[0] == 'Z':  # exited, not yet reaped
+            return False
         return not str(proc_start or '').isdigit() or fields[19] == str(proc_start)
     except Exception:
         pass
@@ -239,13 +244,14 @@ def pid_alive(pid, proc_start):
 
 
 def op_procs(a):
-    procs = []
+    procs, seen = [], []  # seen: config dirs with a sessions/ folder ("no file" there means "not running")
     for d in a.get('dirs') or []:
         sd = os.path.join(d, 'sessions')
         try:
             names = os.listdir(sd)
         except Exception:
             continue
+        seen.append(d)
         for n in names:
             if not re.match(r'^\d+\.json$', n):
                 continue
@@ -270,7 +276,22 @@ def op_procs(a):
             parts = line.split(sep)
             if len(parts) == 2:
                 panes[parts[0]] = parts[1]
-    return {'procs': procs, 'panes': panes}
+    return {'procs': procs, 'panes': panes, 'dirs': seen}
+
+
+def op_screens(a):
+    # bottom of the screen of a claude whose status file says "waiting" (read-only): some dialogs are
+    # on screen before they reach the log
+    out = {}
+    for pane in (a.get('panes') or [])[:20]:
+        if not re.match(r'^%\d+$', str(pane)):
+            continue
+        ok, text, _ = run(['tmux', 'capture-pane', '-p', '-J', '-t', pane])
+        if not ok:
+            continue
+        lines = [l.rstrip() for l in text.split('\n') if l.strip()]
+        out[pane] = '\n'.join(l[:200] for l in lines[-24:])
+    return out
 
 
 def op_tmux(a):
@@ -298,8 +319,175 @@ def op_tmux(a):
     return {'ok': ok, 'error': err.strip()}
 
 
+# ---- closing and deleting sessions (--allow-control only); same rules as lib/control.mjs ----
+SID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+NAME_RE = re.compile(r'^(?!\.\.?$)[^/\\\0]+$')
+TRASH_DIR = 'office-trash'
+
+
+def need_control():
+    if not CONTROL:
+        raise Exception('control disabled (start the server with --allow-control)')
+
+
+def terminal_entry(ep):
+    # the desktop app and IDE extensions manage their own sessions
+    return not ep or ep == 'cli'
+
+
+def read_proc_file(config_dir, pid):
+    try:
+        with open(os.path.join(config_dir, 'sessions', '%d.json' % pid), 'rb') as f:
+            j = json.loads(f.read().decode('utf-8', 'replace'))
+        return j if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+
+def proc_command(pid):
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            return f.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+    except Exception:
+        pass
+    ok, out, _ = run(['ps', '-ww', '-o', 'command=', '-p', str(pid)])
+    return (out or '').strip()
+
+
+def op_kill(a):
+    need_control()
+    pid, sid = int(a.get('pid') or 0), str(a.get('sessionId') or '')
+    if pid <= 0 or not SID_RE.match(sid):
+        raise Exception('bad session')
+    j = read_proc_file(a['configDir'], pid)
+    if not j or j.get('sessionId') != sid:
+        raise Exception('이 세션의 claude 프로세스를 찾지 못했어요 (이미 끝났거나 다른 세션으로 바뀌었어요)')
+    if not terminal_entry(j.get('entrypoint')):
+        raise Exception('터미널에서 연 세션만 닫을 수 있어요')
+    if not pid_alive(pid, j.get('procStart')):
+        return {'ok': True, 'already': True}
+    if not CLAUDE_RE.search(proc_command(pid)):
+        raise Exception('claude 프로세스가 아니라서 건드리지 않았어요')
+    os.kill(pid, 15)  # SIGTERM: Claude Code shuts down cleanly
+    for _ in range(24):
+        time.sleep(0.25)
+        if not pid_alive(pid, j.get('procStart')):
+            return {'ok': True, 'how': 'term'}
+    try:
+        os.kill(pid, 9)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    return {'ok': not pid_alive(pid, j.get('procStart')), 'how': 'kill'}
+
+
+def live_proc(config_dir, sid):
+    for p in op_procs({'dirs': [config_dir]})['procs']:
+        if p.get('sessionId') == sid:
+            return p
+    return None
+
+
+def op_trash(a):
+    need_control()
+    cfg, sid, d = a['configDir'], str(a.get('sessionId') or ''), str(a.get('dirName') or '')
+    if not SID_RE.match(sid) or not NAME_RE.match(d):
+        raise Exception('bad session')
+    if os.path.abspath(a.get('root') or '') != os.path.abspath(os.path.join(cfg, 'projects')):
+        raise Exception('이 위치의 기록은 지울 수 없어요 (설정 폴더/projects 아래만)')
+    if live_proc(cfg, sid):
+        raise Exception('아직 실행 중이에요. 먼저 종료해 주세요')
+    rels = ['projects/%s/%s.jsonl' % (d, sid), 'projects/%s/%s' % (d, sid), 'file-history/' + sid,
+            'session-env/' + sid, 'debug/%s.txt' % sid]
+    try:
+        rels += ['todos/' + n for n in sorted(os.listdir(os.path.join(cfg, 'todos')))
+                 if n.startswith(sid) and n.endswith('.json')]
+    except Exception:
+        pass
+    if not os.path.exists(os.path.join(cfg, rels[0])):
+        raise Exception('기록 파일이 없어요 (이미 지워졌을 수 있어요)')
+    entry = '%s_%s' % (time.strftime('%Y%m%d-%H%M%S', time.gmtime()), sid)
+    box = os.path.join(cfg, TRASH_DIR, entry)
+    items = []
+    try:
+        for rel in rels:
+            src = os.path.join(cfg, rel)
+            if not os.path.lexists(src):
+                continue
+            dst = os.path.join(box, rel)
+            if not os.path.isdir(os.path.dirname(dst)):
+                os.makedirs(os.path.dirname(dst))
+            os.rename(src, dst)
+            items.append(rel)
+    finally:
+        if items:
+            with open(os.path.join(box, 'manifest.json'), 'w') as f:
+                json.dump({'sessionId': sid, 'dirName': d, 'title': a.get('title') or '',
+                           'deletedAt': int(time.time() * 1000), 'items': items}, f, indent=1)
+    return {'ok': True, 'entry': entry, 'items': len(items)}
+
+
+def op_trash_list(a):
+    out = []
+    for d in a.get('dirs') or []:
+        try:
+            names = os.listdir(os.path.join(d, TRASH_DIR))
+        except Exception:
+            continue
+        for n in names:
+            try:
+                with open(os.path.join(d, TRASH_DIR, n, 'manifest.json'), 'rb') as f:
+                    m = json.loads(f.read().decode('utf-8', 'replace'))
+                out.append({'configDir': d, 'entry': n, 'sessionId': m.get('sessionId'), 'dirName': m.get('dirName'),
+                            'title': m.get('title') or '', 'deletedAt': m.get('deletedAt') or 0,
+                            'items': len(m.get('items') or [])})
+            except Exception:
+                pass
+    out.sort(key=lambda x: -x['deletedAt'])
+    return out[:200]
+
+
+def remove_empty_dirs(path):
+    # only empty folders: everything inside was moved back already
+    try:
+        names = os.listdir(path)
+    except Exception:
+        return
+    for n in names:
+        p = os.path.join(path, n)
+        if os.path.isdir(p) and not os.path.islink(p):
+            remove_empty_dirs(p)
+    try:
+        os.rmdir(path)
+    except Exception:
+        pass
+
+
+def op_restore(a):
+    need_control()
+    cfg, entry = a['configDir'], str(a.get('entry') or '')
+    if not NAME_RE.match(entry):
+        raise Exception('bad entry')
+    box = os.path.join(cfg, TRASH_DIR, entry)
+    with open(os.path.join(box, 'manifest.json'), 'rb') as f:
+        m = json.loads(f.read().decode('utf-8', 'replace'))
+    items = [r for r in (m.get('items') or []) if isinstance(r, str) and '..' not in r.split('/')]
+    for rel in items:
+        if os.path.lexists(os.path.join(cfg, rel)):
+            raise Exception('같은 자리에 이미 파일이 있어요: ' + rel)
+    for rel in items:
+        dst = os.path.join(cfg, rel)
+        if not os.path.isdir(os.path.dirname(dst)):
+            os.makedirs(os.path.dirname(dst))
+        os.rename(os.path.join(box, rel), dst)
+    os.unlink(os.path.join(box, 'manifest.json'))
+    remove_empty_dirs(box)
+    return {'ok': True, 'sessionId': m.get('sessionId')}
+
+
 OPS = {'roots': op_roots, 'scan': op_scan, 'poll': op_poll, 'tail': op_tail,
-       'subs': op_subs, 'texts': op_texts, 'panes': op_panes, 'procs': op_procs, 'tmux': op_tmux}
+       'subs': op_subs, 'texts': op_texts, 'panes': op_panes, 'procs': op_procs, 'screens': op_screens, 'tmux': op_tmux,
+       'kill': op_kill, 'trash': op_trash, 'trash_list': op_trash_list, 'restore': op_restore}
 
 
 def main():
@@ -320,7 +508,9 @@ def main():
             rid = req.get('id')
             resp = {'id': rid, 'ok': True, 'result': OPS[req['op']](req.get('args') or {})}
         except Exception as e:
-            resp = {'id': rid, 'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+            # our own messages are plain Exceptions: show them as they are
+            msg = str(e) if type(e) is Exception else '%s: %s' % (type(e).__name__, e)
+            resp = {'id': rid, 'ok': False, 'error': msg}
         w.write(json.dumps(resp) + '\n')
         w.flush()
 

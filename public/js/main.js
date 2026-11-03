@@ -7,6 +7,7 @@ import {
   initUI, initSettings, renderDirectory, renderTop, renderConn, renderLog, scheduleLog, renderChat,
   showTooltip, hideTooltip, select, focusActor, toast, onFleet, closeElevatorOverlay, openElevatorOverlay,
 } from './ui.js';
+import { initManage, onFloorsWait, closeManager } from './manage.js';
 
 const canvas = $('#office');
 initScene(canvas);
@@ -63,6 +64,7 @@ function handle(m) {
       S.accounts = new Map(m.accounts.map((a) => [a.key, a]));
       renderDirectory();
       renderTop();
+      onFloorsWait();
       break;
     }
     case 'view': {
@@ -283,12 +285,14 @@ document.querySelectorAll('[data-cam]').forEach((b) => b.addEventListener('click
 
 window.addEventListener('keydown', (e) => {
   if (e.target.closest('input, textarea, select')) return;
-  if (e.key === 'Escape') { select(null); cam.follow = null; $('#settings').hidden = true; }
+  if (e.key === 'Escape') { select(null); cam.follow = null; $('#settings').hidden = true; closeManager(); }
   else if (e.key === '+' || e.key === '=') setZoom(cam.zoom * 1.25);
   else if (e.key === '-') setZoom(cam.zoom / 1.25);
   else if (e.key === '0') resetCamera();
   else if (e.key === 'f' || e.key === 'F') { const id = S.selected && S.selected.id; if (id && actors.has(id)) { cam.follow = id; if (cam.zoom < 1.6) setZoom(1.8); } }
   else if (e.key === 'a' || e.key === 'A') document.querySelector('[data-tab="agents"]').click();
+  else if (e.key === 'w' || e.key === 'W') document.querySelector('[data-tab="wait"]').click();
+  else if (e.key === 's' || e.key === 'S') $('#sessMgrBtn').click();
   else if (e.key === 'l' || e.key === 'L') document.querySelector('#labelsBtn').click();
   else if (e.key === '[' || e.key === ']') {
     const i = S.floors.findIndex((f) => f.fkey === S.view.floor);
@@ -319,6 +323,7 @@ function frame(now) {
 
 // ---- boot ------------------------------------------------------------------------------
 initUI({ selectFloor, selectSession });
+initManage({ selectFloor, selectSession });
 initSettings(() => connect(S.view.floor, S.view.mode === 'pin' ? S.view.primary : null));
 ensureUser();
 renderConn();

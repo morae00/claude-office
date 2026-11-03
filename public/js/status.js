@@ -1,5 +1,5 @@
 // One place that decides "is this agent working, stuck, done…" for the office, the monitor and alerts.
-import { S, nowS } from './state.js';
+import { S, nowS, esc } from './state.js';
 
 export const STATUS = {
   working: { label: '일하는 중', icon: '🟢', cls: 'ok' },
@@ -45,4 +45,53 @@ export function agentState(actor) {
 
 export function sessionEntry(s) {
   return { busy: s.busy, act: s.claude && s.claude.act, lastTs: s.lastTs };
+}
+
+// Why a session is waiting (server: Hub.attentionOf), for every floor, account and host.
+// `me`: it needs you. `peer` only waits for another session's answer.
+export const WAIT = {
+  permission: { icon: '🔐', label: '권한 승인 대기', me: true },
+  question: { icon: '❓', label: '선택 질문', me: true },
+  plan: { icon: '🗒️', label: '계획 승인 대기', me: true },
+  dialog: { icon: '🪟', label: '창 응답 대기', me: true },
+  reply: { icon: '💬', label: '내 답장 대기', me: true },
+  peer: { icon: '📨', label: '다른 세션 답 대기', me: false },
+};
+
+export function waitOf(sid) {
+  for (const f of S.floors) {
+    const x = f.sessions.find((s) => s.sid === sid);
+    if (x) return x.wait && WAIT[x.wait.kind] ? x.wait : null;
+  }
+  return null;
+}
+
+// [{ s: floor-guide entry, f: floor, w: wait }], the ones that need you first, longest waiting first.
+export function waitList() {
+  const out = [];
+  for (const f of S.floors) for (const s of f.sessions) if (s.wait && WAIT[s.wait.kind]) out.push({ s, f, w: s.wait });
+  return out.sort((a, b) => (WAIT[b.w.kind].me - WAIT[a.w.kind].me) || (a.w.since || 0) - (b.w.since || 0));
+}
+
+const tailText = (t) => { t = String(t || ''); return t.length > 500 ? '…' + t.slice(-500) : t; };
+
+export function waitBodyHtml(w) {
+  const screen = w.screen
+    ? `<details class="screen" ${w.kind === 'dialog' ? 'open' : ''}><summary>🖥 지금 터미널 화면</summary><pre>${esc(w.screen)}</pre></details>`
+    : '';
+  return waitText(w) + screen;
+}
+
+function waitText(w) {
+  switch (w.kind) {
+    case 'question':
+      return (w.questions || []).map((q) => `<div class="wq">${q.header ? `<span class="tag">${esc(q.header)}</span> ` : ''}<b>${esc(q.q || '질문')}</b>${q.multi ? ' <span class="muted small">(여러 개 고르기)</span>' : ''}
+        ${q.options && q.options.length ? `<ol class="opts">${q.options.map((o) => `<li><b>${esc(o.label)}</b>${o.desc ? ` <span class="muted">— ${esc(o.desc)}</span>` : ''}</li>`).join('')}</ol>` : ''}</div>`).join('');
+    case 'plan': return `<div>계획을 세우고 진행해도 될지 묻고 있어요.</div><details><summary>계획 펼쳐 보기</summary><pre>${esc(w.plan || '')}</pre></details>`;
+    case 'permission': return `<div>이 작업을 해도 될지 묻고 있어요: <b>${esc((w.tool && (w.tool.label || w.tool.name)) || '도구 실행')}</b></div>${w.tool && w.tool.detail ? `<pre>${esc(w.tool.detail)}</pre>` : ''}`;
+    case 'dialog': return `<div>${esc(w.text || '터미널에 열린 창이 있어요')}</div>`;
+    case 'reply': return `<div class="muted small">질문으로 턴을 끝내고 쉬고 있어요. 마지막 말:</div><pre class="said">${esc(tailText(w.text))}</pre>`;
+    case 'peer': return `<div>📨 <b>${esc(w.target || '다른 세션')}</b>에 메시지를 보내고 답을 기다려요</div>${w.text ? `<pre class="said">${esc(tailText(w.text))}</pre>` : ''}`;
+  }
+  return '';
 }

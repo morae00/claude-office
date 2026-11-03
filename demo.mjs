@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Demo: fake Claude Code logs for two accounts (alice, bob) working in the same folder,
-// talking to each other through tmux, plus subagents. Starts the office on port 4748.
+// talking to each other through tmux, plus subagents, sessions waiting on a decision and old
+// sessions to tidy up. Starts the office on port 4748 (with --allow-control, on the fake data only).
 //   node demo.mjs            → http://localhost:4748
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +31,7 @@ class Session {
   constructor(cfg, title, cwd = CWD) {
     this.sid = uuid();
     this.cwd = cwd;
+    this.title = title;
     const dir = path.join(cfg, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
     fs.mkdirSync(dir, { recursive: true });
     this.file = path.join(dir, `${this.sid}.jsonl`);
@@ -82,15 +84,67 @@ class Sub {
   }
 }
 
+// A stand-in "claude" process for a session (a renamed `sleep`), with the sessions/<pid>.json Claude Code
+// keeps for it, so the ✋ waiting states and the session manager (close / trash) have something to act on.
+const BIN = path.join(BASE, 'bin');
+fs.mkdirSync(BIN, { recursive: true });
+fs.symlinkSync('/bin/sleep', path.join(BIN, 'claude'));
+const fakes = [];
+function proc(cfg, sess, status, waitingFor) {
+  if (!sess.proc) {
+    const p = spawn(path.join(BIN, 'claude'), ['86400'], { stdio: 'ignore' });
+    sess.proc = p;
+    fakes.push(p);
+    fs.mkdirSync(path.join(cfg, 'sessions'), { recursive: true });
+    // Like Claude Code on a clean exit: the status file goes away with the process.
+    p.once('exit', () => { try { fs.unlinkSync(path.join(cfg, 'sessions', `${p.pid}.json`)); } catch {} });
+  }
+  if (sess.proc.exitCode !== null || sess.proc.signalCode) return; // closed from the office
+  const pid = sess.proc.pid;
+  fs.writeFileSync(path.join(cfg, 'sessions', `${pid}.json`), JSON.stringify({
+    pid, sessionId: sess.sid, cwd: sess.cwd, entrypoint: 'cli', kind: 'interactive', name: sess.title,
+    status, ...(waitingFor ? { waitingFor } : {}), statusUpdatedAt: Date.now(), updatedAt: Date.now(),
+  }));
+}
+
 const alice = account('alice', 'Alice');
 const bob = account('bob', 'Bob');
 const blog = new Session(alice, '블로그 글 다듬기', '/home/dev/blog');
 blog.prompt('지난주 회고 글 맞춤법 봐줘');
 blog.say('맞춤법 고쳐 두었어요.', true);
 
+// Sessions sitting on a decision, and some to tidy up.
+const mig = new Session(bob, 'DB 마이그레이션', '/home/dev/billing');
+mig.prompt('예전 마이그레이션 정리하고 새 스키마 적용해줘');
+mig.say('예전 마이그레이션 폴더를 지우고 새로 적용할게요.');
+mig.tool('Bash', { command: 'rm -rf ./migrations/2023_* && npm run migrate:latest', description: 'Remove old migrations and migrate' });
+proc(bob, mig, 'waiting', 'dialog open');
+const ds = new Session(alice, '디자인 시스템 정리', '/home/dev/design');
+ds.prompt('버튼 컴포넌트 정리해줘');
+ds.tool('AskUserQuestion', { questions: [{ question: '버튼 크기 단계를 몇 개로 둘까요?', header: '크기', multiSelect: false, options: [
+  { label: '3단계 (S·M·L)', description: '지금 쓰는 곳 대부분이 이 셋이에요' },
+  { label: '5단계 (XS~XL)', description: '마케팅 페이지까지 다 맞출 수 있어요' },
+] }] });
+proc(alice, ds, 'waiting', 'input needed');
+const rel = new Session(bob, '릴리스 노트 작성', '/home/dev/billing');
+rel.prompt('이번 배포 릴리스 노트 써줘');
+rel.say('변경 사항 14건을 정리했어요. 결제 API 응답 형식이 바뀌어서 하위 호환이 깨져요.\n\n버전을 **1.4.0**으로 올릴까요, 아니면 **2.0.0**으로 갈까요?', true);
+proc(bob, rel, 'idle');
+const logs = new Session(alice, '로그 정리 스크립트', '/home/dev/ops');
+logs.prompt('오래된 로그 지우는 크론 스크립트 만들어줘');
+logs.say('scripts/cleanup-logs.sh 를 만들었어요.', true);
+proc(alice, logs, 'idle');
+const old = new Session(alice, 'API 문서 번역', '/home/dev/docs');
+old.prompt('API 문서 영어로 옮겨줘');
+old.say('번역 끝났어요.', true);
+const tenDays = (Date.now() - 10 * 86400000) / 1000;
+fs.utimesSync(old.file, tenDays, tenDays);
+
 async function scenario(round) {
   const A = new Session(alice, round === 1 ? '로그인 버그 수정' : `로그인 버그 수정 (${round}회차, /clear 후)`);
   const B = round === 1 ? (scenario.B = new Session(bob, 'E2E 테스트 담당')) : scenario.B;
+  proc(alice, A, 'busy');
+  if (round === 1) proc(bob, B, 'idle');
   await sleep(2500);
 
   A.prompt('로그인하면 세션이 바로 풀리는 버그 고쳐줘. 다 되면 bob 세션한테 e2e 테스트 부탁해.');
@@ -173,18 +227,24 @@ async function scenario(round) {
   await sleep(1800);
   await A.run('Bash', { command: 'git add -A && git commit -m "fix(auth): cookie maxAge in ms"' }, '[fix/login 1a2b3c4] fix(auth)', 2000);
   const qid = A.tool('AskUserQuestion', { questions: [{ question: 'PR 제목을 "로그인 세션이 바로 풀리는 버그 수정"으로 할까요?', header: 'PR', options: [] }] });
-  await sleep(6000);
+  proc(alice, A, 'waiting', 'input needed');
+  await sleep(8000);
   A.result(qid, 'User has answered your questions: "PR 제목을…"="네, 그걸로 해줘"');
+  proc(alice, A, 'busy');
   await sleep(1200);
   await A.run('Bash', { command: 'git push -u origin fix/login && gh pr create --fill' }, 'https://github.com/example/shared-app/pull/42', 3000);
   A.say('PR 올렸습니다! 로그인 세션이 바로 풀리던 문제는 maxAge 단위 때문이었어요.', true);
+  proc(alice, A, 'idle');
+  // The next round is a /clear: this claude moves on to a new session id.
+  if (A.proc) { A.proc.kill(); A.proc = null; }
 }
 
 async function main() {
-  const server = spawn(process.execPath, [path.join(HERE, 'server.mjs'), '--port', String(PORT), '--only-roots',
+  // --allow-control: in the demo, closing / trashing only touches the fake sessions above.
+  const server = spawn(process.execPath, [path.join(HERE, 'server.mjs'), '--port', String(PORT), '--only-roots', '--allow-control',
     '--root', path.join(BASE, '.claude-alice'), '--root', path.join(BASE, '.claude-bob')], { stdio: 'inherit' });
   process.on('SIGINT', () => { server.kill(); process.exit(0); });
-  process.on('exit', () => server.kill());
+  process.on('exit', () => { server.kill(); for (const p of fakes) p.kill(); });
   console.log(`\n🎬 데모 데이터: ${BASE}\n   브라우저에서 http://localhost:${PORT} 을 열어 보세요. (Ctrl+C 로 종료)\n`);
   for (let round = 1; ; round++) {
     await scenario(round);

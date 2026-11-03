@@ -10,7 +10,7 @@ import {
   poly, quad, floorRect, line3, box, face, shadow, floorEllipse, boxHull, inPoly, PITCH,
 } from './iso.js';
 import { drawPerson, SPRITE_W, SPRITE_H } from './sprites.js';
-import { agentState, statusOf } from './status.js';
+import { agentState, statusOf, waitOf, WAIT } from './status.js';
 
 const FONT = '"Pretendard","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Segoe UI",system-ui,sans-serif';
 let g = null;
@@ -735,6 +735,26 @@ function overlayActor(ctx, a, now, staleMs) {
   const st = a.kind === 'agent' ? agentState(a) : null;
   const stale = st && statusOf(st, 'agent', staleMs) === 'stale';
   const busyBubble = a.bubble && performance.now() < a.bubble.until;
+  // Waiting on you: a bobbing sign next to the head, like a Sims "!" (amber when it is your turn).
+  const w = a.kind === 'claude' ? waitOf(a.sid) : null;
+  if (w) {
+    const m = WAIT[w.kind];
+    const bob = Math.sin(now / 260) * 2.5;
+    const cx = fx0 + 17;
+    const cy = headY - 8 + bob;
+    ctx.beginPath(); ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+    ctx.fillStyle = m.me ? 'rgba(245,158,11,.96)' : 'rgba(59,130,246,.92)';
+    ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.stroke();
+    if (m.me) {
+      const pulse = (now / 1100) % 1;
+      ctx.beginPath(); ctx.arc(cx, cy, 11 + pulse * 9, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(245,158,11,${0.55 * (1 - pulse)})`; ctx.lineWidth = 2; ctx.stroke();
+    }
+    ctx.font = `12px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(m.me ? '✋' : '⏳', cx, cy + 0.5);
+  }
   if (stale && !busyBubble) {
     const zt = (now / 1200) % 1;
     ctx.font = `700 ${12 + zt * 4}px ${FONT}`;
