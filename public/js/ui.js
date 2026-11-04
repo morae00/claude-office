@@ -3,7 +3,7 @@
 import { $, $$, S, actors, prefs, savePrefs, isHidden, setHidden, nowS, esc, ago, dur, hhmmss, fmtTok, copyText } from './state.js';
 import { ROOM_INFO, R } from './world.js';
 import { cam, screenOf, setZoom } from './iso.js';
-import { STATUS, statusOf, sessionEntry, WAIT, waitOf, waitList, waitBodyHtml } from './status.js';
+import { STATUS, statusOf, sessionEntry, WAIT, waitOf, waitList, waitBodyHtml, waitRouteHtml } from './status.js';
 import { sendHome, releaseSpot } from './actors.js';
 import { currentBoard } from './scene.js';
 
@@ -362,7 +362,8 @@ function liveBits(t) {
     out.stats = statGrid([['도구 호출', s.stats.tools], ['오류', s.stats.errors], ['요청', s.stats.turns], ['입력 토큰', fmtTok(s.stats.in + s.stats.cacheRead + s.stats.cacheWrite)], ['출력 토큰', fmtTok(s.stats.out)], ['컨텍스트', fmtTok(s.stats.context)], ['마지막 활동', ago(s.lastTs)], ['모델', esc((s.stats.model || '—').replace(/^claude-/, ''))]]);
     out.agents = agentChips(s);
     const w = waitOf(s.sid);
-    out.wait = w ? `<div class="wcard k-${esc(w.kind)} ${WAIT[w.kind].me ? 'me' : ''}"><div class="wc-head"><span class="wk">${WAIT[w.kind].icon} ${esc(WAIT[w.kind].label)}</span></div><div class="wc-body">${waitBodyHtml(w)}</div></div>` : '';
+    const fs = floorSess(s.sid);
+    out.wait = w && fs ? `<div class="wcard k-${esc(w.kind)} ${WAIT[w.kind].me ? 'me' : ''}"><div class="wc-head"><span class="wk">${WAIT[w.kind].icon} ${esc(WAIT[w.kind].label)}</span></div>${waitRouteHtml(fs, S.floors.find((f) => f.sessions.includes(fs)), w)}<div class="wc-body">${waitBodyHtml(w)}</div></div>` : '';
     out.timeline = timeline(s.log.filter((e) => e.who === 'claude' || e.who === 'user' || e.who === 'peer').slice(-40).reverse());
   } else if (t.kind === 'actor' && t.id.startsWith('a:')) {
     const { s, ag } = agentOf(t.id);
@@ -540,7 +541,12 @@ async function loadPanes(sid) {
       box.innerHTML = `<div class="empty">${r.error ? esc(r.error) + ' — ' : ''}claude가 도는 tmux 창을 못 찾았어요. tmux 밖에서 실행 중일 수 있어요.</div>`;
       return;
     }
-    box.innerHTML = panes.slice(0, 6).map((p) => `
+    // When Claude's status file names the pane, that is the only one that matters here; the rest are
+    // other sessions' panes, folded away so nobody answers in the wrong one.
+    const exact = r.exact ? panes.filter((p) => p.id === r.exact) : [];
+    const main = exact.length ? exact : panes.slice(0, 6);
+    const rest = exact.length ? panes.filter((p) => p.id !== r.exact).slice(0, 8) : [];
+    const paneHtml = (p) => `
       <label class="pane ${p.id === paneState.target ? 'best' : ''}">
         <div class="pane-top">${control ? `<input type="radio" name="paneSel" value="${esc(p.id)}" ${p.id === paneState.target ? 'checked' : ''}>` : ''}
           <b>${esc(p.name)}</b> <code>${esc(p.id)}</code>
@@ -550,7 +556,11 @@ async function loadPanes(sid) {
           <button class="mini" data-act="copy" data-text="${esc(`tmux switch-client -t ${p.name.split('.')[0]} \; select-pane -t ${p.id}`)}">🪟 이 창으로 가는 명령 복사</button>
           ${control ? '' : `<button class="mini" data-act="compose" data-pane="${esc(p.id)}">💬 메시지 명령 만들기</button>`}
         </div>
-      </label>`).join('') + (control ? controlBox() : copyBox());
+      </label>`;
+    box.innerHTML = (exact.length ? '<div class="hint top">이 Claude는 아래 창에서 돌고 있어요. 답·입력은 이 창에 하면 돼요.</div>' : '')
+      + main.map(paneHtml).join('')
+      + (rest.length ? `<details class="others"><summary>다른 Claude 창 ${rest.length}개 (다른 세션이 쓰는 창)</summary>${rest.map(paneHtml).join('')}</details>` : '')
+      + (control ? controlBox() : copyBox());
     if (control) {
       box.querySelectorAll('input[name=paneSel]').forEach((el) => el.addEventListener('change', () => bindPane(sid, el.value)));
       const ta = $('#ctlText');

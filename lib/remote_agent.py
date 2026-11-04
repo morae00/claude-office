@@ -268,15 +268,18 @@ def op_procs(a):
                 item[k] = j.get(k)
             item['pid'] = pid
             procs.append(item)
-    panes = {}  # pane id (%0) -> "session:window.pane" for display
+    # pane id (%0) -> "session:window.pane" for display, and whether anyone has that tmux session open
+    panes, attached = {}, {}
     if any(p.get('tmux') for p in procs):
         sep = '|~|'
-        ok, out, _ = run(['tmux', 'list-panes', '-a', '-F', sep.join(['#{pane_id}', '#{session_name}:#{window_index}.#{pane_index}'])])
+        ok, out, _ = run(['tmux', 'list-panes', '-a', '-F',
+                          sep.join(['#{pane_id}', '#{session_name}:#{window_index}.#{pane_index}', '#{session_attached}'])])
         for line in (out or '').split('\n'):
             parts = line.split(sep)
-            if len(parts) == 2:
+            if len(parts) == 3:
                 panes[parts[0]] = parts[1]
-    return {'procs': procs, 'panes': panes, 'dirs': seen}
+                attached[parts[0]] = parts[2].strip().isdigit() and int(parts[2]) > 0
+    return {'procs': procs, 'panes': panes, 'attached': attached, 'dirs': seen}
 
 
 def op_screens(a):

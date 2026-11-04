@@ -139,6 +139,7 @@ node server.mjs --ssh myvm --allow-control --share  # + 화면에서 조종 + �
 | 💬 내 답장 대기 | "…할까요?"처럼 질문으로 턴을 끝내고 쉬는 중 | 마지막 응답의 끝 문장 |
 | 📨 다른 세션 답 대기 | 다른 세션에 물어보고(또는 "답 기다릴게요") 턴을 끝냄 | 세션 간 메시지 + 끝 문장 |
 
+- 카드마다 **🙋 묻는 쪽**(어느 계정 · 세션의 Claude) · **📍 답할 곳**(그 claude가 도는 tmux 창, 예: `dev:0.0 %3`) · **✅ 닫히는 때**, 그리고 알 수 있으면 **📨 일을 맡긴 쪽**(이 세션에 마지막으로 메시지를 보낸 세션)이 나옵니다. 아무도 그 tmux 세션에 붙어 있지 않으면 `ssh -t myvm tmux attach -t …` 안내도 붙어요.
 - 상태 파일은 Claude Code가 실행 중인 claude마다 남기는 `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`(`busy` · `idle` · `waiting`)입니다. 꺼진 세션은 기다리는 사람이 없으니 목록에서 빠집니다.
 - 새 대기가 생기면 토스트와 브라우저 알림, 탭 제목에 `(✋2)`가 붙고, 사무실에선 그 Claude 머리 옆에 ✋가 깜빡입니다.
 - `--allow-control`이면 카드에서 바로 **📨 답장 보내기**(질문으로 끝난 턴), **⏹ 거절 · 취소 (Esc)**(권한 · 선택 창)를 할 수 있어요. 선택지 고르기 · 승인은 그 터미널에서 해 주세요 — `🪟 그 tmux 창으로 가는 명령 복사`가 있습니다.
@@ -167,7 +168,7 @@ node server.mjs --ssh myvm --allow-control --share  # + 화면에서 조종 + �
 <summary>메시지를 어떻게 찾아내나요?</summary>
 
 1. 보내는 쪽: `tmux send-keys -t <pane> "..." Enter`, `tmux set-buffer … && tmux paste-buffer -t …`, SendMessage 도구, 세션 메시지 MCP 도구를 도구 기록에서 찾습니다.
-2. 받는 쪽: 다른 세션에 **같은 내용의 프롬프트**가 3분 안에 들어오면 둘을 이어 붙입니다. `<…-message from="…">` 형태로 들어온 메시지는 보낸 세션 이름으로 바로 연결해요.
+2. 받는 쪽: 다른 세션에 **같은 내용의 프롬프트**가 3분 안에 들어오면 둘을 이어 붙입니다. `<…-message from="…">` 형태로 들어온 메시지는 보낸 세션 이름으로 바로 연결해요. 보낸 곳이 `uds:/…/cc-socks/<pid>.sock`이면 그 pid의 `sessions/<pid>.json`으로 어느 세션인지 찾고, 이미 꺼진 claude면 "닫힌 Claude (pid …)"로 표시합니다.
 3. 받는 쪽 기록을 읽을 수 없으면 15초 뒤 "📮 tmux bob"처럼 보낸 대상으로만 표시합니다.
 
 </details>

@@ -251,6 +251,8 @@ class Hub {
       this.registerRoots(src, roots);
       src.roots = roots;
       src.rootsAt = now;
+      // Know which claude runs which session before replaying logs, so message senders resolve.
+      if (!src.procs) await this.scanProcs(src).catch(() => {});
     }
     if (!src.roots.length) return;
     const res = await src.call('scan', { roots: src.roots.map((r) => r.root) });
@@ -403,14 +405,14 @@ class Hub {
   async scanProcs(src) {
     const dirs = [...new Set((src.roots || []).map((r) => r.configDir.replace(/\/+$/, '')))];
     if (!dirs.length) return;
-    const { procs = [], panes = {}, dirs: seen } = await src.call('procs', { dirs });
+    const { procs = [], panes = {}, attached = {}, dirs: seen } = await src.call('procs', { dirs });
     const map = new Map();
     for (const p of procs) {
       const m = /^(.+):@?\d*\.(%\d+)$/.exec(p.tmux || '');
       map.set(`${p.configDir}|${p.sessionId}`, {
         sid: p.sessionId, pid: p.pid, name: p.name || '', status: p.status || '', cwd: p.cwd || '',
         waitingFor: p.waitingFor || '', statusUpdatedAt: Number(p.statusUpdatedAt) || 0, entrypoint: p.entrypoint || '',
-        tmux: m ? { session: m[1], pane: m[2], name: panes[m[2]] || null } : null,
+        tmux: m ? { session: m[1], pane: m[2], name: panes[m[2]] || null, attached: !!attached[m[2]] } : null,
       });
     }
     // A claude waiting on a dialog: read the bottom of its pane, the dialog may not be in the log yet.
@@ -426,10 +428,26 @@ class Hub {
     src.procDirs = new Set(seen || []);
   }
 
+  // A wait, plus who is on the other end: the session that last handed this one work (`from`), and for
+  // "waiting on another session", which session that is (`to`).
+  attentionOf(s) {
+    const a = this.waitState(s);
+    if (!a) return null;
+    const l = [...this.broker.links].reverse().find((x) => x.to && x.to.sid === s.id && x.from && x.from.sid && x.from.sid !== s.id);
+    if (l && (!a.since || (l.ts <= a.since + 60000 && a.since - l.ts < 24 * 3600 * 1000))) {
+      a.from = { sid: l.from.sid, label: l.from.label, acct: l.from.acct, color: l.from.color, ts: l.ts, via: l.via, text: String(l.text || '').slice(0, 160) };
+    }
+    if (a.kind === 'peer') {
+      const id = this.resolveSessionName(String(a.target || '').replace(/^tmux\s+/, '').replace(/:.*$/, ''), s.id);
+      if (id) a.to = this.sessionRef(id);
+    }
+    return a;
+  }
+
   // Is this session waiting on a human, and for what? Claude's own status file says whether it is
   // waiting (a dialog is open); the log says on what (a question, a plan, a tool to allow) or how the
   // last turn ended (with a question to you, or after messaging another session).
-  attentionOf(s) {
+  waitState(s) {
     const p = this.procOf(s);
     if (p && p.status && p.status !== 'idle' && p.status !== 'waiting') return null; // busy, running a shell command, …
     const w = this.watchers.get(s.id);
@@ -563,21 +581,41 @@ class Hub {
 
   sessionRef(id, hint) {
     const s = id && this.sessions.get(id);
-    if (!s) return { sid: null, label: hint || '?', acct: '', color: '#888', floor: null, fkey: null };
+    if (!s) {
+      // A socket path we couldn't tie to a session (that claude has since closed): say what it was.
+      const sock = /cc-socks\/(\d+)\.sock$/.exec(String(hint || ''));
+      return { sid: null, label: sock ? `닫힌 Claude (pid ${sock[1]})` : hint || '?', acct: '', color: '#888', floor: null, fkey: null };
+    }
     const acct = this.accounts.get(s.akey);
     const f = this.floors.get(s.fkey);
-    return { sid: id, label: s.title || hint || s.sid.slice(0, 8), acct: acct ? acct.label : '', color: acct ? acct.color : '#888', floor: f ? f.num : null, fkey: s.fkey };
+    const w = this.watchers.get(s.id);
+    const p = this.procOf(s);
+    // Untitled sessions: the name Claude gave that claude, then its tmux session, before a bare id.
+    const label = s.title || (w && w.model.title) || (p && p.name) || (hint && !/cc-socks\//.test(hint) ? hint : '')
+      || (p && p.tmux ? `tmux ${p.tmux.session}` : '') || s.sid.slice(0, 8);
+    return { sid: id, label, acct: acct ? acct.label : '', color: acct ? acct.color : '#888', floor: f ? f.num : null, fkey: s.fkey };
   }
 
   resolveSessionName(name, exceptId) {
     if (!name) return null;
     const n = String(name).trim();
+    const bare = n.replace(/^@/, '');
+    const except = this.sessions.get(exceptId);
+    // Claude Code's session messaging names the sender by its socket, uds:/…/cc-socks/<pid>.sock:
+    // that pid is a claude whose sessions/<pid>.json says which session it has open.
+    const sock = /cc-socks\/(\d+)\.sock$/.exec(n);
     let best = null;
     for (const s of this.sessions.values()) {
       if (s.id === exceptId) continue;
+      const p = this.procOf(s);
+      if (sock) {
+        if (p && p.pid === Number(sock[1]) && (!except || s.src === except.src)) return s.id;
+        continue;
+      }
       const w = this.watchers.get(s.id);
       const names = w ? [w.model.title, ...w.model.names] : [s.title];
-      if ((s.id === n || s.sid === n || s.sid.startsWith(n) || names.includes(n)) && (!best || this.betterCopy(s, best))) best = s;
+      if (p && p.name) names.push(p.name);
+      if ((s.id === n || s.sid === n || s.sid.startsWith(n) || names.includes(n) || names.includes(bare)) && (!best || this.betterCopy(s, best))) best = s;
     }
     return best ? best.id : null;
   }
@@ -642,7 +680,7 @@ class Hub {
 
   procBits(s) {
     const p = this.procOf(s);
-    return { tmux: (p && p.tmux) || null, procName: p ? p.name : null, procStatus: p ? p.status : null, live: !!p };
+    return { tmux: (p && p.tmux) || null, procName: p ? p.name : null, procStatus: p ? p.status : null, live: !!p, entry: (p && p.entrypoint) || s.entrypoint || '' };
   }
 
   broadcastLink(link) {
@@ -652,7 +690,7 @@ class Hub {
 
 // sessions/<pid>.json "waitingFor" when no question / plan / tool call explains it.
 const WAITING_FOR = {
-  'input needed': '입력을 기다려요', 'dialog open': '열린 창에서 선택을 기다려요', 'sandbox request': '샌드박스 허용을 기다려요',
+  'input needed': '입력 요청(MCP 서버 등)에 대한 답을 기다려요', 'dialog open': '열린 창에서 선택을 기다려요', 'sandbox request': '샌드박스 허용을 기다려요',
   'goal proposal': '목표 제안 확인을 기다려요', 'worker request': '작업자 요청 확인을 기다려요',
 };
 

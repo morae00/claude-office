@@ -1,5 +1,5 @@
 // One place that decides "is this agent working, stuck, done…" for the office, the monitor and alerts.
-import { S, nowS, esc } from './state.js';
+import { S, nowS, esc, ago } from './state.js';
 
 export const STATUS = {
   working: { label: '일하는 중', icon: '🟢', cls: 'ok' },
@@ -74,6 +74,40 @@ export function waitList() {
 }
 
 const tailText = (t) => { t = String(t || ''); return t.length > 500 ? '…' + t.slice(-500) : t; };
+
+const CLOSES = {
+  permission: '그 창에서 허용하거나 거절하면 이 알림이 닫혀요',
+  question: '그 창에서 선택지를 고르면 닫혀요',
+  plan: '그 창에서 계획을 승인하거나 고칠 점을 말하면 닫혀요',
+  dialog: '그 창에서 입력하거나 고르면 닫혀요',
+  reply: '이 Claude에게 답장하면(그 창에 입력) 닫혀요',
+};
+
+// Who is waiting, where to answer, what closes it, and who handed it the work.
+// s: floor-guide entry of the waiting session, f: its floor.
+export function waitRouteHtml(s, f, w) {
+  const a = S.accounts.get(s.akey);
+  const chip = (label, color) => `<span class="acct" style="--c:${esc(color || '#64748b')}">${esc(label || '?')}</span>`;
+  const me = `${chip(a && a.label, a && a.color)}<b>${esc(s.title || '새 세션')}</b> <span class="muted">${f ? `${f.num}F ${esc(f.name)}${f.host ? ` · 🖥 ${esc(f.host)}` : ''}` : ''}</span>`;
+  const t = s.tmux;
+  const term = t
+    ? `${f && f.host ? `🖥 ${esc(f.host)}의 ` : ''}tmux <b>${esc(t.name || t.session)}</b> <code>${esc(t.pane)}</code>`
+    : /^claude-/.test(s.entry || '') ? `Claude ${s.entry === 'claude-desktop' ? '데스크톱 앱' : '앱'}에서 연 이 세션`
+      : '이 세션이 열린 터미널 (tmux 밖이라 위치를 몰라요)';
+  const rows = w.kind === 'peer'
+    ? [['⏳ 기다리는 쪽', `Claude ${me}`],
+      ['📍 답할 쪽', w.to ? `${chip(w.to.acct, w.to.color)}<b>${esc(w.to.label)}</b>${w.to.floor ? ` <span class="muted">${w.to.floor}F</span>` : ''}` : `<b>${esc(w.target || '다른 세션')}</b>`],
+      ['✅ 닫히는 때', '그 세션이 답을 보내오면 닫혀요 (내가 이 Claude에게 직접 알려 줘도 돼요)']]
+    : [['🙋 묻는 쪽', `Claude ${me}`], ['📍 답할 곳', term], ['✅ 닫히는 때', CLOSES[w.kind] || '그 창에서 답하면 닫혀요']];
+  if (w.from) {
+    rows.push(['📨 일을 맡긴 쪽', `${chip(w.from.acct, w.from.color)}<b>${esc(w.from.label)}</b> <span class="muted">· ${ago(w.from.ts)} · ${esc(w.from.via)}</span><div class="muted small">"${esc(w.from.text)}"</div>`]);
+  }
+  const attach = `${f && f.host ? `ssh -t ${f.host} ` : ''}tmux attach -t ${t ? t.session : ''}`;
+  const warn = t && !t.attached && w.kind !== 'peer'
+    ? `<div class="rwarn">👀 지금 tmux 세션 <b>${esc(t.session)}</b>을 열어 둔 사람이 없어요. 아무도 이 질문을 못 보고 있을 수 있어요 — <code>${esc(attach)}</code>로 붙어서 확인하세요.</div>`
+    : '';
+  return `<div class="route">${rows.map(([k, v]) => `<div class="rr"><span class="rk">${k}</span><span class="rv">${v}</span></div>`).join('')}${warn}</div>`;
+}
 
 export function waitBodyHtml(w) {
   const screen = w.screen

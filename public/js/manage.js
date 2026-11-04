@@ -1,7 +1,7 @@
 // The "✋ waiting on you" inbox (every floor, account and host) and the session manager:
 // every session in the building, with closing them and moving them to the trash (--allow-control).
 import { $, $$, S, esc, ago, copyText } from './state.js';
-import { WAIT, waitList, waitBodyHtml } from './status.js';
+import { WAIT, waitList, waitBodyHtml, waitRouteHtml } from './status.js';
 import { toast, controlCall, notify, setTab } from './ui.js';
 
 let H = {}; // selectSession(sid), selectFloor(fkey) from main.js
@@ -40,11 +40,6 @@ let waitKey = '';
 const seenWaits = new Set();
 let firstFloors = true;
 
-function where(s, f) {
-  const a = S.accounts.get(s.akey);
-  return `${a ? `<span class="acct" style="--c:${esc(a.color)}">${esc(a.label)}</span>` : ''}<span class="muted">${f.num}F ${esc(f.name)}${f.host ? ` · 🖥 ${esc(f.host)}` : ''}${s.tmux ? ` · 🪟 ${esc(s.tmux.name || s.tmux.session)}` : ''}</span>`;
-}
-
 function gotoCmd(s, f) {
   if (!s.tmux) return '';
   return f.host ? `ssh -t ${f.host} tmux attach -t ${shq(s.tmux.session)}` : `tmux switch-client -t ${shq(s.tmux.session)} \\; select-pane -t ${s.tmux.pane}`;
@@ -74,7 +69,7 @@ export function renderWaits(force) {
     const canEsc = control && ['permission', 'question', 'plan', 'dialog'].includes(w.kind) && s.live && s.tmux;
     return `<div class="wcard k-${esc(w.kind)} ${m.me ? 'me' : ''}" data-sid="${esc(s.sid)}">
       <div class="wc-head"><span class="wk">${m.icon} ${esc(m.label)}</span><b class="wt">${esc(s.title || '새 세션')}</b><span class="since" data-since="${Number(w.since) || 0}">${ago(w.since)}부터</span></div>
-      <div class="wc-where">${where(s, f)}</div>
+      ${waitRouteHtml(s, f, w)}
       <div class="wc-body">${waitBodyHtml(w)}</div>
       ${canReply ? `<div class="compose control"><textarea rows="2" data-sid="${esc(s.sid)}" placeholder="이 Claude에게 답장 (⌘/Ctrl + Enter로 보내기)">${esc(drafts.get(s.sid) || '')}</textarea></div>` : ''}
       <div class="actions">

@@ -308,6 +308,14 @@ label.pane { cursor: pointer; }
 .wc-body pre.said { font-size: 12px; }
 .wc-body details { margin: 6px 0 0; padding: 6px 8px; }
 .wc-body details.screen pre { font: 11px/1.45 ui-monospace, Menlo, monospace; background: #0f172a; color: #e2e8f0; border-color: #0f172a; max-height: 300px; }
+.route { display: grid; gap: 4px; padding: 7px 9px; border-radius: 10px; background: rgba(255,255,255,.7); border: 1px solid var(--line); font-size: 12px; }
+.route .rr { display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: baseline; }
+.route .rk { color: var(--muted); font-weight: 700; white-space: nowrap; }
+.route .rv { min-width: 0; overflow-wrap: anywhere; }
+.route .rv code { font-size: 11px; background: rgba(59,130,246,.1); color: #1d4ed8; padding: 0 5px; border-radius: 5px; }
+.route .rwarn { margin-top: 2px; padding: 5px 8px; border-radius: 8px; background: rgba(245,158,11,.12); color: #92400e; line-height: 1.45; }
+details.others { margin: 4px 0; padding: 6px 8px; }
+details.others summary { color: var(--muted); }
 .wq { margin: 2px 0 4px; }
 .wq .tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 6px; background: rgba(245,158,11,.18); color: #92400e; }
 .opts { margin: 4px 0 0; padding-left: 20px; display: grid; gap: 2px; font-size: 12px; }
